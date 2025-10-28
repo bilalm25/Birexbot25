@@ -19,7 +19,7 @@ async function askGemini(prompt) {
     console.log("📝 Prompt:", prompt);
     console.log("🔑 API Key exists:", !!GEMINI_API_KEY);
     
-    const url = `https://generativelanguage.googleapis.com/v1/models/gemini-1.0-pro:generateContent?key=${GEMINI_API_KEY}`;
+    const url = `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-pro:generateContent?key=${GEMINI_API_KEY}`;
     
     const body = {
       contents: [{ 
@@ -138,4 +138,5 @@ app.get("/", (req, res) => {
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
 });
+
 
