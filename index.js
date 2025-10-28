@@ -1,169 +1,121 @@
+// index.js
 import express from "express";
-import cors from "cors";
+import fetch from "node-fetch";
+import dotenv from "dotenv";
 import admin from "firebase-admin";
 
+dotenv.config();
 const app = express();
-const PORT = process.env.PORT || 3000;
+app.use(express.json({ limit: "200kb" }));
 
-// Environment Variables
-const COLLECT_API_KEY = process.env.COLLECT_API_KEY;
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const FIRESTORE_PROJECT_ID = process.env.FIRESTORE_PROJECT_ID;
-
-// ⚠️ تهيئة Firebase Admin
-try {
-  const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-  
-  admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount),
-    projectId: FIRESTORE_PROJECT_ID
-  });
-  
-  console.log("✅ Firebase Admin initialized successfully");
-} catch (error) {
-  console.error("❌ Error initializing Firebase:", error);
+// بساطة: حماية بمفتاح API في header x-api-key أو Authorization: Bearer <key>
+function checkApiKey(req, res, next) {
+  const key = (req.headers["x-api-key"] || (req.headers["authorization"] || "")).toString();
+  const expected = process.env.COLLECT_API_KEY;
+  if (!expected) return res.status(500).json({ error: "Server missing COLLECT_API_KEY" });
+  if (key.startsWith("Bearer ")) {
+    if (key.split(" ")[1] === expected) return next();
+  } else if (key === expected) return next();
+  return res.status(401).json({ error: "Unauthorized - invalid API key" });
 }
 
-const db = admin.firestore();
+// init Firestore if service account provided as JSON in ENV
+if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
+  const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
+  admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount),
+    projectId: process.env.FIRESTORE_PROJECT_ID
+  });
+  console.log("Firestore initialized");
+}
+const db = admin.apps.length ? admin.firestore() : null;
 
-// Middleware
-app.use(cors());
-app.use(express.json());
+/** Helper: call Gemini (Generative Language API)
+  * NOTE: API schema may change - we log raw response for debugging.
+  */
+async function askGemini(prompt) {
+  const key = process.env.GEMINI_API_KEY;
+  if (!key) return "GPT service not configured.";
 
-// Middleware للتحقق من API Key
-const authenticateAPIKey = (req, res, next) => {
-  const apiKey = req.headers['x-api-key'] || req.headers['authorization'];
-  
-  if (!apiKey || apiKey !== COLLECT_API_KEY) {
-    return res.status(401).json({
-      status: "error",
-      message: "غير مصرح بالوصول - API Key غير صحيح"
-    });
-  }
-  next();
-};
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateText?key=${key}`;
 
-// المسار الأساسي
-app.get("/", (req, res) => {
-  res.send("✅ Webhook is working fine!");
-});
+  // Simple body - adapt if Google changes schema
+  const body = {
+    prompt: {
+      text: prompt
+    },
+    maxOutputTokens: 300
+  };
 
-// ⚠️ مسار Dialogflow مع حفظ البيانات في Firestore
-app.post("/api/collect-chat-data", authenticateAPIKey, async (req, res) => {
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  });
+
+  const data = await resp.json();
+  console.log("Gemini response (raw):", JSON.stringify(data).slice(0, 1000));
+  // try a few places for text
+  if (data?.candidates?.[0]?.output) return data.candidates[0].output;
+  if (data?.output?.[0]?.content) return JSON.stringify(data.output[0].content);
+  if (data?.text) return data.text;
+  return JSON.stringify(data).slice(0, 800);
+}
+
+// Main endpoint
+app.post("/api/collect-chat-data", checkApiKey, async (req, res) => {
   try {
-    console.log("📨 تم استلام بيانات من Dialogflow:", req.body);
-    
-    const {
-      session_id,
-      user_id,
-      user_message,
-      bot_response,
-      intent,
-      confidence,
-      parameters,
-      timestamp
-    } = req.body;
+    const payload = req.body || {};
+    payload.receivedAt = new Date().toISOString();
 
-    // 💾 حفظ البيانات في Firestore
-    const chatData = {
-      session_id: session_id || `session_${Date.now()}`,
-      user_id: user_id || 'anonymous',
-      user_message: user_message,
-      bot_response: bot_response,
-      intent: intent,
-      confidence: confidence || 0,
-      parameters: parameters || {},
-      timestamp: timestamp || new Date().toISOString(),
-      created_at: admin.firestore.FieldValue.serverTimestamp()
-    };
-
-    // حفظ في collection "chat_logs"
-    const docRef = await db.collection('chat_logs').add(chatData);
-    
-    console.log("💾 تم حفظ البيانات في Firestore مع ID:", docRef.id);
-
-    // رد بنجاح
-    res.json({
-      status: "success",
-      message: "تم استلام وحفظ البيانات بنجاح",
-      firestore_id: docRef.id,
-      received_at: new Date().toISOString()
-    });
-
-  } catch (error) {
-    console.error("❌ خطأ في معالجة البيانات:", error);
-    res.status(500).json({
-      status: "error",
-      message: "حدث خطأ في الخادم",
-      error: error.message
-    });
-  }
-});
-
-// 🔍 مسار لاسترجاع البيانات (للتطوير)
-app.get("/api/chat-logs", authenticateAPIKey, async (req, res) => {
-  try {
-    const snapshot = await db.collection('chat_logs')
-      .orderBy('created_at', 'desc')
-      .limit(10)
-      .get();
-    
-    const logs = [];
-    snapshot.forEach(doc => {
-      logs.push({
-        id: doc.id,
-        ...doc.data()
-      });
-    });
-
-    res.json({
-      status: "success",
-      count: logs.length,
-      logs: logs
-    });
-
-  } catch (error) {
-    console.error("❌ خطأ في استرجاع البيانات:", error);
-    res.status(500).json({
-      status: "error",
-      message: "حدث خطأ في استرجاع البيانات"
-    });
-  }
-});
-
-// 🤖 مسار لاختبار Gemini AI
-app.post("/api/ask-gemini", authenticateAPIKey, async (req, res) => {
-  try {
-    const { message } = req.body;
-    
-    if (!GEMINI_API_KEY) {
-      return res.status(500).json({
-        status: "error",
-        message: "Gemini API Key غير مضبوط"
-      });
+    if (!payload.sessionId || !payload.message) {
+      // still save minimal if exists
+      if (!payload.sessionId) payload.sessionId = `s_${Date.now()}`;
+      if (!payload.message) payload.message = "";
     }
 
-    // TODO: سيتم إضافة كود Gemini AI لاحقاً
-    console.log("🤖 رسالة لـ Gemini:", message);
+    // query small results from Firestore if client sent parameters (example)
+    let propertiesFound = [];
+    if (db && payload.parameters?.city) {
+      const snap = await db.collection("properties")
+        .where("city", "==", payload.parameters.city)
+        .limit(5)
+        .get();
+      snap.forEach(d => propertiesFound.push(d.data()));
+    }
 
-    res.json({
-      status: "success",
-      message: "سيتم إضافة Gemini AI قريباً",
-      your_message: message
-    });
+    // Prepare prompt to Gemini
+    let prompt = `You are a professional real estate assistant. The user said: "${payload.message}".`;
+    if (propertiesFound.length) {
+      prompt += ` Found ${propertiesFound.length} matching properties. Example: ${propertiesFound.map(p=>`${p.type} in ${p.city} ${p.rooms||""} rooms ${p.price||""}`).join(" | ")}`;
+    }
+    prompt += " Reply in Arabic, short, friendly, ask next step (contact/visit).";
 
-  } catch (error) {
-    console.error("❌ خطأ في Gemini:", error);
-    res.status(500).json({
-      status: "error",
-      message: "حدث خطأ في خدمة AI"
+    // Ask Gemini
+    const aiReply = await askGemini(prompt);
+
+    // Save lead/data in Firestore if available
+    if (db) {
+      const docRef = db.collection("chat_leads").doc(payload.sessionId + "-" + Date.now());
+      await docRef.set({ ...payload, aiReply });
+    } else {
+      // fallback: log to console (or to file if you add fs)
+      console.log("Saved locally:", payload);
+    }
+
+    // return structured response
+    return res.json({
+      ok: true,
+      aiReply,
+      saved: !!db
     });
+  } catch (err) {
+    console.error("Error in collect endpoint:", err);
+    return res.status(500).json({ error: "Server error" });
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-  console.log(`🔑 API Key مضبوط: ${!!COLLECT_API_KEY}`);
-  console.log(`🤖 Gemini مضبوط: ${!!GEMINI_API_KEY}`);
-  console.log(`🔥 Firebase مضبوط: ${!!FIRESTORE_PROJECT_ID}`);
-});
+app.get("/api/health", (req, res) => res.json({ status: "ok", time: new Date().toISOString() }));
+
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
