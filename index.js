@@ -1,4 +1,3 @@
-// index.js
 import express from "express";
 import fetch from "node-fetch";
 import dotenv from "dotenv";
@@ -8,7 +7,7 @@ dotenv.config();
 const app = express();
 app.use(express.json({ limit: "200kb" }));
 
-// بساطة: حماية بمفتاح API في header x-api-key أو Authorization: Bearer <key>
+
 function checkApiKey(req, res, next) {
   const key = (req.headers["x-api-key"] || (req.headers["authorization"] || "")).toString();
   const expected = process.env.COLLECT_API_KEY;
@@ -119,3 +118,4 @@ app.get("/api/health", (req, res) => res.json({ status: "ok", time: new Date().t
 
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
+
